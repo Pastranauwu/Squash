@@ -11,6 +11,8 @@ import java.awt.event.KeyListener;
 import java.io.File;
 import java.io.IOException;
 import java.util.Random;
+import java.util.ArrayList;
+import java.util.List;
 import javax.sound.sampled.AudioInputStream;
 import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.Clip;
@@ -24,8 +26,15 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.SwingConstants;
 import javax.swing.Timer;
+import javax.swing.JRadioButton;
+import javax.swing.ButtonGroup;
+import javax.swing.BorderFactory;
 
 public class pingPong extends JPanel implements ActionListener {
+
+    // Modos de juego
+    public enum GameMode { PINGPONG, SQUASH }
+    private GameMode gameMode = GameMode.PINGPONG;
 
     // Pelota (posiciones en double para mejor física)
     private double x;
@@ -64,6 +73,31 @@ public class pingPong extends JPanel implements ActionListener {
     private boolean juegoActivo = true;
     private boolean derrotaMostrada = false;
 
+    // Power-ups
+    private enum PowerType { PADDLE_WIDER, BALL_BIGGER, BALL_SMALLER, BALL_BLINK, BALL_SPEED_UP, BALL_SLOW_DOWN }
+    private static class PowerUp {
+        int x, y, r;
+        Color color;
+        PowerType type;
+        PowerUp(int x, int y, int r, Color c, PowerType t) { this.x=x; this.y=y; this.r=r; this.color=c; this.type=t; }
+    }
+    private final List<PowerUp> powerUps = new ArrayList<>();
+    private int baseLargo;
+    private int baseDiametro;
+    private double blinkToggleMs = 150; // parpadeo
+    private long lastBlinkToggle = 0L;
+    private boolean drawBall = true;
+    private double speedMultiplier = 1.0;
+    private long untilPaddleWider = 0L;
+    private long untilBallBigger = 0L;
+    private long untilBallSmaller = 0L;
+    private long untilBlink = 0L;
+    private long untilSpeedUp = 0L;
+    private long untilSlowDown = 0L;
+    private long lastSpawnTime = 0L;          // último spawn de power-up
+    private long spawnIntervalMs = 4000L;     // intervalo entre spawns
+    private int maxActivePowerUps = 3;        // máximo de power-ups activos
+
     // IA (predicción + media móvil)
     private double cpuTargetXEMA = -1; // suavizado del objetivo X
     private double cpuAlpha = 0.25; // factor de suavizado
@@ -92,6 +126,16 @@ public class pingPong extends JPanel implements ActionListener {
         double angle = Math.toRadians(new Random().nextInt(120) + 30); // 30..150 grados
         this.dx = speed * Math.cos(angle);
         this.dy = Math.abs(speed * Math.sin(angle)); // hacia abajo al inicio
+
+        // bases para revertir efectos
+        this.baseLargo = this.largo;
+        this.baseDiametro = this.diametro;
+        generarPowerUpsIniciales();
+    }
+
+    public pingPong(GameMode mode) {
+        this();
+        this.gameMode = mode;
     }
 
     // metodo que genera los distintos sonidos
@@ -145,14 +189,27 @@ public class pingPong extends JPanel implements ActionListener {
         g.setFont(fuente);
         g.drawString(s2 + nivel, 0, 10);
         g.drawString("P1  " + s + score, 210, 10);
-        g.drawString("CPU " + s + scoreCPU, 210, 30);
+        if (gameMode == GameMode.PINGPONG) g.drawString("CPU " + s + scoreCPU, 210, 30);
 
-        g.setColor(Color.BLUE);
-        g.fillRoundRect(CPU_X, CPU_Y, largo, ancho, ancho, ancho);
+        // CPU paddle solo en modo Ping Pong
+        if (gameMode == GameMode.PINGPONG) {
+            g.setColor(Color.BLUE);
+            g.fillRoundRect(CPU_X, CPU_Y, largo, ancho, ancho, ancho);
+        }
         g.setColor(Color.red);
         g.fillRoundRect(pos_x, pos_y, largo, ancho, ancho, ancho);
-        g.setColor(Color.white);
-        g.fillOval((int) Math.round(x), (int) Math.round(y), diametro, diametro);
+
+        // Power-ups
+        for (PowerUp p : powerUps) {
+            g.setColor(p.color);
+            g.fillOval(p.x - p.r, p.y - p.r, p.r * 2, p.r * 2);
+        }
+
+        // Pelota (con invisibilidad parpadeante)
+        if (shouldDrawBall()) {
+            g.setColor(Color.white);
+            g.fillOval((int) Math.round(x), (int) Math.round(y), diametro, diametro);
+        }
 
     }
 
@@ -238,6 +295,7 @@ public class pingPong extends JPanel implements ActionListener {
     }
 
     private void moverCPU() {
+        if (gameMode != GameMode.PINGPONG) return;
         // Predice donde interceptará la pelota en la línea del CPU
         double targetX = predecirIntercepcionX(CPU_Y + ancho);
         if (cpuTargetXEMA < 0) cpuTargetXEMA = targetX;
@@ -309,9 +367,16 @@ public class pingPong extends JPanel implements ActionListener {
             audioSeguro(2);
         }
 
+        // Rebote superior en modo Squash (sin paddle CPU)
+        if (gameMode == GameMode.SQUASH && y <= 0) {
+            y = 0;
+            dy = Math.abs(dy);
+            audioSeguro(2);
+        }
+
         // Paddles
         Rectangle paddleJugador = new Rectangle(pos_x, pos_y, largo, ancho);
-        Rectangle paddleCPU = new Rectangle(CPU_X, CPU_Y, largo, ancho);
+    Rectangle paddleCPU = new Rectangle(CPU_X, CPU_Y, largo, ancho);
 
         // Jugador (abajo) - colisión superior de la raqueta
         if (dy > 0 && colisionaCon(paddleJugador, 2)) {
@@ -321,7 +386,7 @@ public class pingPong extends JPanel implements ActionListener {
             double centroPelota = x + diametro / 2.0;
             double centroPaddle = pos_x + largo / 2.0;
             double offset = (centroPelota - centroPaddle) / (largo / 2.0); // -1..1
-            double speed = Math.hypot(dx, dy) * 1.03; // leve aceleración
+            double speed = Math.hypot(dx, dy) * 1.03 * speedMultiplier; // leve aceleración + mult
             double maxAngle = Math.toRadians(60);
             double angle = -maxAngle * offset; // hacia arriba
             dx = speed * Math.sin(angle);
@@ -332,12 +397,12 @@ public class pingPong extends JPanel implements ActionListener {
         }
 
         // CPU (arriba) - colisión inferior de la raqueta
-        if (dy < 0 && colisionaCon(paddleCPU, 2)) {
+        if (gameMode == GameMode.PINGPONG && dy < 0 && colisionaCon(paddleCPU, 2)) {
             y = CPU_Y + ancho + 1;
             double centroPelota = x + diametro / 2.0;
             double centroPaddle = CPU_X + largo / 2.0;
             double offset = (centroPelota - centroPaddle) / (largo / 2.0);
-            double speed = Math.hypot(dx, dy) * (1.01 + (nivel * 0.01));
+            double speed = Math.hypot(dx, dy) * (1.01 + (nivel * 0.01)) * speedMultiplier;
             double maxAngle = Math.toRadians(55);
             double angle = maxAngle * offset; // hacia abajo
             dx = speed * Math.sin(angle);
@@ -354,6 +419,10 @@ public class pingPong extends JPanel implements ActionListener {
                 mensajeDerrota();
             }
         }
+
+        // Power-Ups
+        chequearPowerUps();
+        actualizarEfectosTemporales();
     }
 
     private void subirDificultad() {
@@ -369,36 +438,87 @@ public class pingPong extends JPanel implements ActionListener {
         // no usado con el nuevo bucle, mantenido por compatibilidad
     }
 
-     public static void mostrarVentanaInicio() {
-        // Crear ventana de inicio
-        JDialog ventanaInicio = new JDialog();
-        ventanaInicio.setTitle("Instrucciones");
-        ventanaInicio.setSize(300, 200);
-        ventanaInicio.setLocationRelativeTo(null);
-        ventanaInicio.setModal(true);
+     private static GameMode mostrarMenuInicio() {
+        // Menú principal con fondo gif, selección de modo y sin música
+        final GameMode[] elegido = { GameMode.PINGPONG };
+        JDialog dialogo = new JDialog((JFrame) null, "Squash - Menú", true);
+        dialogo.setSize(400, 600);
+        dialogo.setLocationRelativeTo(null);
 
-        // Configurar contenido
-        JPanel panel = new JPanel();
-        panel.setLayout(new BorderLayout());
-        JLabel label = new JLabel("<html><center>El Jugador 1 comienza.<br>¡Presiona Start para jugar!</center></html>", JLabel.CENTER);
-        JButton botonStart = new JButton("Start");
+        // Fondo con el mismo gif del juego
+        ImageIcon fondo = new ImageIcon("Assets/fondo2.gif");
+        JLabel fondoLbl = new JLabel(fondo);
+        fondoLbl.setLayout(new BorderLayout());
+        dialogo.setContentPane(fondoLbl);
 
-        // Agregar evento al botón
-        botonStart.addActionListener(e -> ventanaInicio.dispose());
+        // Panel superior (título)
+        JLabel titulo = new JLabel("<html><div style='text-align:center;'>SQUASH / PING PONG</div></html>", JLabel.CENTER);
+        titulo.setFont(new Font("Monospaced", Font.BOLD, 18));
+        titulo.setForeground(Color.WHITE);
+        JPanel header = new JPanel(new BorderLayout());
+        header.setOpaque(false);
+        header.add(titulo, BorderLayout.CENTER);
 
-        // Añadir componentes al panel
-        panel.add(label, BorderLayout.CENTER);
-        panel.add(botonStart, BorderLayout.SOUTH);
+        // Panel central con opciones
+        JPanel centro = new JPanel();
+        centro.setOpaque(false);
+        centro.setLayout(new BorderLayout());
 
-        // Configurar la ventana
-        ventanaInicio.add(panel);
-        ventanaInicio.setVisible(true);
+        JPanel opciones = new JPanel();
+        opciones.setOpaque(false);
+        JRadioButton rbPing = new JRadioButton("Modo Ping Pong (vs CPU)");
+        JRadioButton rbSquash = new JRadioButton("Modo Squash (1 jugador)");
+        rbPing.setOpaque(false);
+        rbSquash.setOpaque(false);
+        rbPing.setForeground(Color.WHITE);
+        rbSquash.setForeground(Color.WHITE);
+        rbPing.setSelected(true);
+        ButtonGroup grupo = new ButtonGroup();
+        grupo.add(rbPing);
+        grupo.add(rbSquash);
+        opciones.add(rbPing);
+        opciones.add(rbSquash);
+
+        JLabel info = new JLabel(
+            "<html><div style='color:white;text-align:center;padding:6px;'>" +
+            "Controles: Flechas o WASD.<br>" +
+            "Colecciona power-ups para alterar la jugabilidad." +
+            "</div></html>", JLabel.CENTER);
+        centro.add(opciones, BorderLayout.CENTER);
+        centro.add(info, BorderLayout.SOUTH);
+
+        // Panel inferior con acciones
+        JPanel acciones = new JPanel();
+        acciones.setOpaque(false);
+        JButton iniciar = new JButton("Iniciar");
+        JButton salir = new JButton("Salir");
+        iniciar.addActionListener(e -> {
+            elegido[0] = rbPing.isSelected() ? GameMode.PINGPONG : GameMode.SQUASH;
+            dialogo.dispose();
+        });
+        salir.addActionListener(e -> System.exit(0));
+        acciones.add(iniciar);
+        acciones.add(salir);
+
+        // Margen y composición
+        JPanel mainOverlay = new JPanel(new BorderLayout(8, 8));
+        mainOverlay.setOpaque(false);
+        mainOverlay.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        mainOverlay.add(header, BorderLayout.NORTH);
+        mainOverlay.add(centro, BorderLayout.CENTER);
+        mainOverlay.add(acciones, BorderLayout.SOUTH);
+
+        dialogo.setLayout(new BorderLayout());
+        dialogo.add(mainOverlay, BorderLayout.CENTER);
+        dialogo.setVisible(true);
+        return elegido[0];
     }
 
     public static void main(String[] args)
             throws InterruptedException, UnsupportedAudioFileException, IOException, LineUnavailableException {
 
-        mostrarVentanaInicio();
+    // Mostrar menú de inicio (con gif y sin música) y leer modo
+    GameMode modoSeleccionado = mostrarMenuInicio();
         // Crear ventana principal
         Ventana_Principal.setSize(400, 630);
         Ventana_Principal.setVisible(true);
@@ -434,7 +554,7 @@ public class pingPong extends JPanel implements ActionListener {
         });
 
         try {
-            juego = new pingPong();
+            juego = new pingPong(modoSeleccionado);
             Ventana_Principal.add(juego);
             audio(1);
 
@@ -476,6 +596,157 @@ public class pingPong extends JPanel implements ActionListener {
         dy = Math.abs(speed * Math.sin(angle));
         juegoActivo = true;
     derrotaMostrada = false;
+        // revertir efectos
+        largo = baseLargo;
+        diametro = baseDiametro;
+        speedMultiplier = 1.0;
+        untilPaddleWider = untilBallBigger = untilBallSmaller = untilBlink = untilSpeedUp = untilSlowDown = 0L;
+        drawBall = true;
+        powerUps.clear();
+    lastSpawnTime = System.currentTimeMillis();
+    generarPowerUpsIniciales();
+    }
+
+    // (Menú de selección reemplazado por mostrarMenuInicio())
+
+    // ---- Power-Ups: generación, colisiones y efectos ----
+    private void generarPowerUpsIniciales() {
+        // Generar un único power-up al inicio; el spawner hará el resto
+        lastSpawnTime = System.currentTimeMillis();
+        PowerUp p = spawnPowerUp();
+        if (p != null) powerUps.add(p);
+    }
+
+    private PowerUp spawnPowerUp() {
+        int w = Math.max(1, getWidth());
+        int h = Math.max(1, getHeight());
+        if (w <= 1 || h <= 1) return null;
+        Random r = new Random();
+        int px = r.nextInt(Math.max(1, w - 80)) + 40;
+        int py = r.nextInt(Math.max(1, h - 260)) + 120; // evitar bordes y raquetas
+        PowerType t = PowerType.values()[r.nextInt(PowerType.values().length)];
+        return new PowerUp(px, py, 8, colorPorTipo(t), t);
+    }
+
+    private Color colorPorTipo(PowerType t) {
+        switch (t) {
+            case PADDLE_WIDER: return Color.GREEN;
+            case BALL_BIGGER: return Color.YELLOW;
+            case BALL_SMALLER: return new Color(148, 0, 211); // púrpura
+            case BALL_BLINK: return Color.WHITE;
+            case BALL_SPEED_UP: return Color.RED;
+            case BALL_SLOW_DOWN: return Color.CYAN;
+        }
+        return Color.LIGHT_GRAY;
+    }
+
+    private void chequearPowerUps() {
+        if (powerUps.isEmpty()) return;
+        double cx = x + diametro / 2.0;
+        double cy = y + diametro / 2.0;
+        List<PowerUp> consumidos = new ArrayList<>();
+        for (PowerUp p : powerUps) {
+            double dist = Math.hypot(cx - p.x, cy - p.y);
+            if (dist <= (diametro / 2.0 + p.r)) {
+                activarPowerUp(p);
+                consumidos.add(p);
+            }
+        }
+        powerUps.removeAll(consumidos);
+    }
+
+    private void activarPowerUp(PowerUp p) {
+        long ahora = System.currentTimeMillis();
+        int duracion = 6000; // 6 segundos por defecto
+        switch (p.type) {
+            case PADDLE_WIDER:
+                largo = (int) Math.round(baseLargo * 1.5);
+                untilPaddleWider = ahora + duracion;
+                break;
+            case BALL_BIGGER:
+                diametro = Math.min((int) Math.round(baseDiametro * 1.6), Math.min(getWidth(), getHeight()) / 4);
+                untilBallBigger = ahora + duracion;
+                untilBallSmaller = 0; // anula opuesto
+                break;
+            case BALL_SMALLER:
+                diametro = Math.max((int) Math.round(baseDiametro * 0.6), 8);
+                untilBallSmaller = ahora + duracion;
+                untilBallBigger = 0;
+                break;
+            case BALL_BLINK:
+                untilBlink = ahora + duracion;
+                break;
+            case BALL_SPEED_UP:
+                speedMultiplier = 1.4;
+                // reescalar dx,dy al instante
+                normalizarVelocidad(Math.hypot(dx, dy) * speedMultiplier);
+                untilSpeedUp = ahora + duracion;
+                untilSlowDown = 0;
+                break;
+            case BALL_SLOW_DOWN:
+                speedMultiplier = 0.6;
+                normalizarVelocidad(Math.hypot(dx, dy) * speedMultiplier);
+                untilSlowDown = ahora + duracion;
+                untilSpeedUp = 0;
+                break;
+        }
+    }
+
+    private void normalizarVelocidad(double nuevaRapidez) {
+        double ang = Math.atan2(dy, dx);
+        dx = nuevaRapidez * Math.cos(ang);
+        dy = nuevaRapidez * Math.sin(ang);
+    }
+
+    private void actualizarEfectosTemporales() {
+        long ahora = System.currentTimeMillis();
+        // Parpadeo
+        if (ahora < untilBlink) {
+            if (ahora - lastBlinkToggle > blinkToggleMs) {
+                drawBall = !drawBall;
+                lastBlinkToggle = ahora;
+            }
+        } else {
+            drawBall = true;
+        }
+        // Paddle wider
+        if (untilPaddleWider > 0 && ahora > untilPaddleWider) {
+            largo = baseLargo;
+            untilPaddleWider = 0;
+        }
+        // Tamaño de pelota
+        if (untilBallBigger > 0 && ahora > untilBallBigger) {
+            diametro = baseDiametro;
+            untilBallBigger = 0;
+        }
+        if (untilBallSmaller > 0 && ahora > untilBallSmaller) {
+            diametro = baseDiametro;
+            untilBallSmaller = 0;
+        }
+        // Velocidad
+        if (untilSpeedUp > 0 && ahora > untilSpeedUp) {
+            speedMultiplier = 1.0;
+            normalizarVelocidad(Math.max(2.5, Math.hypot(dx, dy) / 1.4));
+            untilSpeedUp = 0;
+        }
+        if (untilSlowDown > 0 && ahora > untilSlowDown) {
+            speedMultiplier = 1.0;
+            normalizarVelocidad(Math.min(6.0, Math.hypot(dx, dy) / 0.6));
+            untilSlowDown = 0;
+        }
+        // Spawner incremental: añade 1 power-up cada cierto tiempo hasta un máximo
+        if (juegoActivo) {
+            long ahora2 = System.currentTimeMillis();
+            if (powerUps.size() < maxActivePowerUps && (ahora2 - lastSpawnTime) >= spawnIntervalMs) {
+                PowerUp nuevo = spawnPowerUp();
+                if (nuevo != null) powerUps.add(nuevo);
+                lastSpawnTime = ahora2;
+            }
+        }
+    }
+
+    private boolean shouldDrawBall() {
+        return drawBall;
     }
 
 }
