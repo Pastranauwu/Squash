@@ -3,6 +3,7 @@ import java.awt.Color;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.Graphics;
+import java.awt.Rectangle;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.event.KeyEvent;
@@ -22,27 +23,30 @@ import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.SwingConstants;
+import javax.swing.Timer;
 
 public class pingPong extends JPanel implements ActionListener {
 
-    // Posicion que servira para la pelota y su diametro
-    private static int x;
-    private static int y;
-    private static int diametro;
+    // Pelota (posiciones en double para mejor física)
+    private double x;
+    private double y;
+    private int diametro;
+    private double dx; // velocidad horizontal
+    private double dy; // velocidad vertical
 
     // Posicion que servira para la raqueta definbiendo su largo y ancho
     private int pos_x;
     private int pos_y;
 
-    private static int CPU_X;
-    private static int CPU_Y;
+    private int CPU_X;
+    private int CPU_Y; // se fija cerca de la parte superior
 
     private final int ancho;
-    private static int largo;
+    private int largo;
 
     // variables para las fisicas
-    private boolean pelotaHaciaDerecha = true;
-    private static boolean pelotaHaciaAbajo = true;
+    // Control de juego
+    //
 
     // variables que manejan el juego
     static pingPong juego;
@@ -53,31 +57,41 @@ public class pingPong extends JPanel implements ActionListener {
     private int nivel;
     private String s = "Puntuacion: ";
     private String s2 = "Nivel: ";
-    private static long velocidad = 10;
-    private boolean reinicio = false;
+    private static int FRAME_DELAY_MS = 16; // ~60 FPS
     JFrame ventanaPerdida;
     static JFrame Ventana_Principal = new JFrame("Ping Pong");
-    private Thread hiloMovimiento;
-    private Thread hiloCPU;
-    private static boolean turnoCPU = false;
-    private static boolean juegoActivo = true;
+    private Timer gameTimer;
+    private boolean juegoActivo = true;
+    private boolean derrotaMostrada = false;
+
+    // IA (predicción + media móvil)
+    private double cpuTargetXEMA = -1; // suavizado del objetivo X
+    private double cpuAlpha = 0.25; // factor de suavizado
+    private double cpuMaxSpeed = 5.0; // pixeles por frame
 
     // constructor inicial
     public pingPong() {
         this.x = num_Aleatorio();
+        this.y = 100; // arranque algo bajo
         this.pos_x = 170;
-        this.pos_y = 535;
+        this.pos_y = 535; // paddle jugador abajo
         this.ancho = 15;
-        this.largo = 60;
-        this.diametro = 20;
+        this.largo = 80; // un poco más ancho
+        this.diametro = 18;
         this.nivel = 1;
         this.score = 0;
         this.scoreCPU = 0;
         this.fuente = new Font("Monospaced", Font.BOLD, 15);
         this.imagenFondo = new ImageIcon("Assets/fondo2.gif");
         this.setSize(400, 600);
-        this.CPU_X = (400 / 2) - 30;
-        this.CPU_Y = (600 / 2);
+        this.CPU_Y = 30; // paddle CPU arriba fijo
+        this.CPU_X = (400 / 2) - 40;
+
+        // velocidad inicial (dirección aleatoria)
+        double speed = 4.0;
+        double angle = Math.toRadians(new Random().nextInt(120) + 30); // 30..150 grados
+        this.dx = speed * Math.cos(angle);
+        this.dy = Math.abs(speed * Math.sin(angle)); // hacia abajo al inicio
     }
 
     // metodo que genera los distintos sonidos
@@ -101,8 +115,9 @@ public class pingPong extends JPanel implements ActionListener {
                 break;
             }
             case 3: {
+                // Usar sonido existente para evento de derrota
                 AudioInputStream perdiste = AudioSystem
-                        .getAudioInputStream((new File("Assets/muerte.wav")).getAbsoluteFile());
+                        .getAudioInputStream((new File("Assets/colision.wav")).getAbsoluteFile());
                 Clip sonido = AudioSystem.getClip();
                 sonido.open(perdiste);
                 sonido.start();
@@ -137,14 +152,16 @@ public class pingPong extends JPanel implements ActionListener {
         g.setColor(Color.red);
         g.fillRoundRect(pos_x, pos_y, largo, ancho, ancho, ancho);
         g.setColor(Color.white);
-        g.fillOval(x, y, diametro, diametro);
+        g.fillOval((int) Math.round(x), (int) Math.round(y), diametro, diametro);
 
     }
 
     // genera una ventana nueva que muestra que perdiste
     public void mensajeDerrota() throws UnsupportedAudioFileException, IOException, LineUnavailableException {
 
-        if(!turnoCPU){
+    if(derrotaMostrada) return;
+    derrotaMostrada = true;
+    if(score >= scoreCPU){
             ventanaPerdida = new JFrame("Perdiste");
         }else{
             ventanaPerdida = new JFrame("Ganaste");
@@ -180,8 +197,9 @@ public class pingPong extends JPanel implements ActionListener {
         // Agregar el panel de botones a la parte inferior
         ventanaPerdida.add(panelBotones, BorderLayout.SOUTH);
         ventanaPerdida.setVisible(true);
-        velocidad = 80;
-        audio(3);
+    // Pausar animación
+    if (gameTimer != null) gameTimer.stop();
+    audioSeguro(3);
         System.out.println("Perdiste");
 
     }
@@ -193,16 +211,9 @@ public class pingPong extends JPanel implements ActionListener {
         // System.out.println(command);
         if (command.equals("Si")) {
             // Reiniciar el juego
-            reinicio = true;
-            x = num_Aleatorio();
-            y = 0;
-            score = 0;
-            scoreCPU = 0;
-            nivel = 1;
-            velocidad = 10;
-            pelotaHaciaDerecha = true;
-            pelotaHaciaAbajo = true;
+            resetGame();
             ventanaPerdida.setVisible(false);
+            if (gameTimer != null) gameTimer.start();
         } else {
             System.exit(ABORT);
         }
@@ -226,148 +237,136 @@ public class pingPong extends JPanel implements ActionListener {
         }
     }
 
-    public static void posicionRaquetaCPU() {
-        int[][] movimientos = new int[4][2];
-        int[][] mejorMovimiento = new int[1][2];
-        // voy a definir la primea fila para izquierda, segunda arriba, tercera derecha
-        // y por ultimo abajo
+    private void moverCPU() {
+        // Predice donde interceptará la pelota en la línea del CPU
+        double targetX = predecirIntercepcionX(CPU_Y + ancho);
+        if (cpuTargetXEMA < 0) cpuTargetXEMA = targetX;
+        // Suavizado (media móvil exponencial) para un movimiento más humano
+        cpuTargetXEMA = cpuAlpha * targetX + (1 - cpuAlpha) * cpuTargetXEMA;
 
-        // defino un nuevo vector con el mejor movimiento y su valor, si es 0 es el
-        // padre;
-        while (true) {
-            mejorMovimiento[0][0] = 0;
-            mejorMovimiento[0][1] = distanciaEuclidiana(CPU_X, CPU_Y);
-            if (turnoCPU && juegoActivo && pelotaHaciaAbajo) {
-                for (int i = 1; i <= 4; i++) {
-                    switch (i) {
-                        case 1:
-                            movimientos[0][0] = CPU_X - 15;
-                            movimientos[0][1] = CPU_Y;
-                        case 2:
-                            movimientos[1][1] = CPU_Y - 15;
-                            movimientos[1][0] = CPU_X;
-                        case 3:
-                            movimientos[2][0] = CPU_X + 15;
-                            movimientos[2][1] = CPU_Y;
-                        case 4:
-                            movimientos[3][1] = CPU_Y + 15;
-                            movimientos[3][0] = CPU_X;
-                    }
+        // Mover horizontalmente hacia el objetivo con límite de velocidad
+        double centroCPU = CPU_X + (largo / 2.0);
+        double delta = cpuTargetXEMA - centroCPU;
+        double step = Math.max(-cpuMaxSpeed, Math.min(cpuMaxSpeed, delta));
+        CPU_X += (int) Math.round(step);
 
-                    // System.out.println("Padre " + mejorMovimiento[0][1] + " hijo "
-                    // + distanciaEuclidiana(movimientos[i - 1][0], movimientos[i - 1][1]));
-                    if (mejorMovimiento[0][1] > distanciaEuclidiana(movimientos[i - 1][0], movimientos[i - 1][1])) {
-                        // System.out.println("Mejor movimiento " + i);
-                        mejorMovimiento[0][0] = i;
-                        mejorMovimiento[0][1] = distanciaEuclidiana(movimientos[i - 1][0], movimientos[i - 1][1]);
-                    }
-                }
-
-                // System.out.println("Entre en "+ mejorMovimiento[0][0]);
-                switch (mejorMovimiento[0][0]) {
-                    case 1:
-                        CPU_X = CPU_X - 15;
-                        break;
-                    case 2:
-                        CPU_Y = CPU_Y - 15;
-                        break;
-                    case 3:
-                        CPU_X = CPU_X + 15;
-                        break;
-                    case 4:
-                        CPU_Y = CPU_Y + 15;
-                        break;
-                }
-            }
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
-            }
-        }
-
+        // Limites
+        if (CPU_X < 0) CPU_X = 0;
+        if (CPU_X + largo > getWidth()) CPU_X = Math.max(0, getWidth() - largo);
     }
 
-    public static int distanciaEuclidiana(int xr, int yr) {
-        xr = (xr + largo) / 2;
-        return (int) Math.sqrt((Math.pow((xr - ((x + diametro) / 2)), 2) + Math.pow((yr - (y + diametro)), 2)));
+    private double predecirIntercepcionX(int lineaY) {
+        // Simula el movimiento de la pelota reflejando en paredes hasta alcanzar lineaY
+        double simX = x + diametro / 2.0;
+        double simY = y + diametro / 2.0;
+        double vx = dx;
+        double vy = dy;
+        int maxIters = 2000; // seguridad
+        int w = Math.max(1, getWidth());
+    // int h = Math.max(1, getHeight()); // no se usa aquí
+        for (int i = 0; i < maxIters; i++) {
+            if ((vy < 0 && simY <= lineaY) || (vy > 0 && simY >= lineaY)) break;
+            simX += vx;
+            simY += vy;
+            // rebotes laterales
+            if (simX - diametro / 2.0 <= 0) { simX = diametro / 2.0; vx = Math.abs(vx); }
+            if (simX + diametro / 2.0 >= w) { simX = w - diametro / 2.0; vx = -Math.abs(vx); }
+        }
+        return simX; // centro esperado
     }
 
     // metodo que verifica si pego en la raqueta o no
-    public boolean pegoEnRaqueta(int rx) {
-        if (x >= rx && x <= rx + largo) {
-            turnoCPU = true;
-            return true;
-        }
-        return false;
+    private boolean colisionaCon(Rectangle paddle, int tolerancia) {
+        // Rectángulo de la pelota (con pequeño margen)
+        Rectangle ball = new Rectangle((int) Math.round(x), (int) Math.round(y), diametro, diametro);
+        Rectangle paddleInflada = new Rectangle(paddle);
+        paddleInflada.grow(tolerancia, tolerancia);
+        return paddleInflada.intersects(ball);
     }
 
     // metodo que mueve la pelota
-    private void movimientoPelota() throws UnsupportedAudioFileException, IOException, LineUnavailableException {
-
-        if (pelotaHaciaDerecha) {
-            x = x + 1;
-        } else {
-            x = x - 1;
+    private void actualizarFisica() throws UnsupportedAudioFileException, IOException, LineUnavailableException {
+        // Evitar cálculos antes de tener tamaño válido
+        if (getWidth() <= 0 || getHeight() <= 0) {
+            return;
         }
 
-        if (pelotaHaciaAbajo) {
-            y = y + 1;
-        } else {
-            y = y - 1;
+        // mover pelota
+        x += dx;
+        y += dy;
+
+    int w = getWidth();
+    int h = getHeight();
+
+        // Colisiones con paredes laterales
+        if (x <= 0) {
+            x = 0;
+            dx = Math.abs(dx);
+            audioSeguro(2);
+        } else if (x + diametro >= w) {
+            x = w - diametro;
+            dx = -Math.abs(dx);
+            audioSeguro(2);
         }
 
-        if (y == (pos_y - diametro) && !turnoCPU) {
-            if (pegoEnRaqueta(pos_x)) {
-                y = y - 1;
-                score = score + 10;
-                pelotaHaciaAbajo = false;
-                pingPong.audio(2);
-                if (nivel >= 1) {
-                    if (scoreCPU >= nivel * (20)) {
-                        velocidad = (long) (velocidad - nivel * (0.001));
-                        nivel = nivel + 1;
-                    }
-                }
+        // Paddles
+        Rectangle paddleJugador = new Rectangle(pos_x, pos_y, largo, ancho);
+        Rectangle paddleCPU = new Rectangle(CPU_X, CPU_Y, largo, ancho);
+
+        // Jugador (abajo) - colisión superior de la raqueta
+        if (dy > 0 && colisionaCon(paddleJugador, 2)) {
+            // Recolocar justo arriba
+            y = pos_y - diametro - 1;
+            // Ajustar ángulo según punto de impacto
+            double centroPelota = x + diametro / 2.0;
+            double centroPaddle = pos_x + largo / 2.0;
+            double offset = (centroPelota - centroPaddle) / (largo / 2.0); // -1..1
+            double speed = Math.hypot(dx, dy) * 1.03; // leve aceleración
+            double maxAngle = Math.toRadians(60);
+            double angle = -maxAngle * offset; // hacia arriba
+            dx = speed * Math.sin(angle);
+            dy = -Math.abs(speed * Math.cos(angle));
+            score += 10;
+            if (score % 40 == 0) subirDificultad();
+            audioSeguro(2);
+        }
+
+        // CPU (arriba) - colisión inferior de la raqueta
+        if (dy < 0 && colisionaCon(paddleCPU, 2)) {
+            y = CPU_Y + ancho + 1;
+            double centroPelota = x + diametro / 2.0;
+            double centroPaddle = CPU_X + largo / 2.0;
+            double offset = (centroPelota - centroPaddle) / (largo / 2.0);
+            double speed = Math.hypot(dx, dy) * (1.01 + (nivel * 0.01));
+            double maxAngle = Math.toRadians(55);
+            double angle = maxAngle * offset; // hacia abajo
+            dx = speed * Math.sin(angle);
+            dy = Math.abs(speed * Math.cos(angle));
+            scoreCPU += 10;
+            if (scoreCPU % 40 == 0) subirDificultad();
+            audioSeguro(2);
+        }
+
+        // Pérdida del jugador
+        if (y + diametro >= h) {
+            if (!derrotaMostrada) {
+                juegoActivo = false;
+                mensajeDerrota();
             }
-        }
-
-        if (y == (CPU_Y - diametro) && turnoCPU) {
-            if (pegoEnRaqueta(CPU_X)) {
-                CPU_Y = CPU_Y - 1;
-                scoreCPU = scoreCPU + 10;
-                pelotaHaciaAbajo = false;
-                turnoCPU = false;
-                pingPong.audio(2);
-            }
-        }
-
-        if (y == diametro) {
-            y = y + 1;
-            pelotaHaciaAbajo = true;
-            pingPong.audio(2);
-        }
-
-        if (y + diametro == getHeight()) {
-            mensajeDerrota();
-        }
-
-        if (x == getWidth() - diametro) {
-            x = x - 1;
-            pelotaHaciaDerecha = false;
-            pingPong.audio(2);
-        }
-
-        if (x == 0) {
-            x = x + 1;
-            pelotaHaciaDerecha = true;
-            pingPong.audio(2);
         }
     }
 
+    private void subirDificultad() {
+        nivel++;
+        cpuMaxSpeed = Math.min(cpuMaxSpeed + 0.5, 10.0);
+    }
+
+    private void audioSeguro(int tipo) {
+        try { audio(tipo); } catch (Exception ignored) {}
+    }
+
     public static void movimientoCPU() {
-        posicionRaquetaCPU();
+        // no usado con el nuevo bucle, mantenido por compatibilidad
     }
 
      public static void mostrarVentanaInicio() {
@@ -409,7 +408,7 @@ public class pingPong extends JPanel implements ActionListener {
         Ventana_Principal.addKeyListener(new KeyListener() {
             @Override
             public void keyPressed(KeyEvent e) {
-                String tecla = e.getKeyText(e.getKeyCode());
+                String tecla = KeyEvent.getKeyText(e.getKeyCode());
                 // System.out.println("La letra es " + tecla);
 
                 if (tecla.equals("Left") || tecla.equals("A")) {
@@ -443,39 +442,40 @@ public class pingPong extends JPanel implements ActionListener {
             System.out.println(e.getMessage());
         }
 
-        juego.hiloMovimiento = new Thread(() -> {
-            while (true) {
-                try {
-                    juego.movimientoPelota();
-                    Thread.sleep(velocidad);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-        });
-
-        juego.hiloCPU = new Thread(() -> {
-            while (true) {
-                try {
-                    movimientoCPU();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-        });
-
-        juego.hiloMovimiento.start();
-        juego.hiloCPU.start();
-
-        while (true) {
+        // Bucle de juego seguro para Swing (un solo hilo - EDT)
+        juego.gameTimer = new Timer(FRAME_DELAY_MS, ev -> {
             try {
-                juego.repaint();
-                Thread.sleep(16);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
+                if (juego.juegoActivo) {
+                    juego.actualizarFisica();
+                    juego.moverCPU();
+                }
+            } catch (Exception ex) {
+                ex.printStackTrace();
             }
-        }
+            juego.repaint();
+        });
+        juego.gameTimer.start();
 
+    }
+
+    private void resetGame() {
+        x = num_Aleatorio();
+        y = 100;
+        pos_x = 170;
+        pos_y = 535;
+        CPU_Y = 30;
+        CPU_X = (getWidth() > 0 ? getWidth() : 400) / 2 - (largo / 2);
+        score = 0;
+        scoreCPU = 0;
+        nivel = 1;
+        cpuMaxSpeed = 5.0;
+        cpuTargetXEMA = -1;
+        double speed = 4.0;
+        double angle = Math.toRadians(new Random().nextInt(120) + 30);
+        dx = speed * Math.cos(angle);
+        dy = Math.abs(speed * Math.sin(angle));
+        juegoActivo = true;
+    derrotaMostrada = false;
     }
 
 }
